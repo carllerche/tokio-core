@@ -1,3 +1,4 @@
+//!
 //! Readiness tracking streams, backing I/O objects.
 //!
 //! This module contains the core type which is used to back all I/O on object
@@ -6,18 +7,19 @@
 //! acquisition of a token, and tracking of the readiness state on the
 //! underlying I/O primitive.
 
+#![allow(warnings)]
+
+use tokio::reactor::{Handle, Registration};
+
+use futures::{task, Async, Poll};
+use mio;
+use mio::event::Evented;
+use tokio_io::{AsyncRead, AsyncWrite};
+
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
-
-use futures::{task, Async, Poll};
-use mio::event::Evented;
-use mio::Ready;
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio::reactor::{Registration};
-
-use reactor::{Handle, Remote};
 
 /// A concrete implementation of a stream of readiness notifications for I/O
 /// objects that originates from an event loop.
@@ -67,7 +69,6 @@ use reactor::{Handle, Remote};
 pub struct PollEvented<E> {
     io: E,
     inner: Inner,
-    remote: Remote,
 }
 
 struct Inner {
@@ -80,191 +81,65 @@ struct Inner {
     write_readiness: AtomicUsize,
 }
 
-impl<E: Evented> PollEvented<E> {
-    /// Creates a new readiness stream associated with the provided
-    /// `loop_handle` and for the given `source`.
-    ///
-    /// This method returns a future which will resolve to the readiness stream
-    /// when it's ready.
-    pub fn new(io: E, handle: &Handle) -> io::Result<PollEvented<E>> {
-        let registration = Registration::new();
-        registration.register(&io)?;
+// ===== impl PollEvented =====
 
-        Ok(PollEvented {
+impl<E> PollEvented<E>
+where E: Evented
+{
+    /// Creates a new `PollEvented` associated with the default reactor.
+    pub fn new(io: E) -> PollEvented<E> {
+        PollEvented {
             io: io,
             inner: Inner {
-                registration,
+                registration: Registration::new(),
                 read_readiness: AtomicUsize::new(0),
                 write_readiness: AtomicUsize::new(0),
-            },
-            remote: handle.remote().clone(),
-        })
+            }
+        }
     }
 
-    /// Deregisters this source of events from the reactor core specified.
-    ///
-    /// This method can optionally be called to unregister the underlying I/O
-    /// object with the event loop that the `handle` provided points to.
-    /// Typically this method is not required as this automatically happens when
-    /// `E` is dropped, but for some use cases the `E` object doesn't represent
-    /// an owned reference, so dropping it won't automatically unregister with
-    /// the event loop.
-    ///
-    /// This consumes `self` as it will no longer provide events after the
-    /// method is called, and will likely return an error if this `PollEvented`
-    /// was created on a separate event loop from the `handle` specified.
-    pub fn deregister(self, _: &Handle) -> io::Result<()> {
-        // Nothing has to happen here anymore as I/O objects are explicitly
-        // deregistered before dropped.
-        Ok(())
+    /// Creates a new `PollEvented` associated with the specified reactor.
+    pub fn new_with_handle(io: E, handle: &Handle) -> io::Result<Self> {
+        let ret = PollEvented::new(io);
+        ret.inner.registration.register_with(&ret.io, handle)?;
+        Ok(ret)
     }
-}
 
-impl<E> PollEvented<E> {
     /// Tests to see if this source is ready to be read from or not.
     ///
-    /// If this stream is not ready for a read then `NotReady` will be returned
-    /// and the current task will be scheduled to receive a notification when
-    /// the stream is readable again. In other words, this method is only safe
-    /// to call from within the context of a future's task, typically done in a
-    /// `Future::poll` method.
-    ///
-    /// This is mostly equivalent to `self.poll_ready(Ready::readable())`.
+    /// If this stream is not ready for a read then `Async::NotReady` will be
+    /// returned and the current task will be scheduled to receive a
+    /// notification when the stream is readable again. In other words, this
+    /// method is only safe to call from within the context of a future's task,
+    /// typically done in a `Future::poll` method.
     ///
     /// # Panics
     ///
     /// This function will panic if called outside the context of a future's
     /// task.
-    pub fn poll_read(&self) -> Async<()> {
-        if self.poll_read2().is_ready() {
-            return ().into();
-        }
+    pub fn poll_read_ready(&self) -> Poll<mio::Ready, io::Error> {
+        self.register()?;
 
-        Async::NotReady
-    }
-
-    fn poll_read2(&self) -> Async<Ready> {
         // Load the cached readiness
         match self.inner.read_readiness.load(Relaxed) {
             0 => {}
             mut n => {
                 // Check what's new with the reactor.
-                if let Some(ready) = self.inner.registration.take_read_ready().unwrap() {
+                if let Some(ready) = self.inner.registration.take_read_ready()? {
                     n |= super::ready2usize(ready);
                     self.inner.read_readiness.store(n, Relaxed);
                 }
 
-                return super::usize2ready(n).into();
+                return Ok(super::usize2ready(n).into());
             }
         }
 
-        let ready = match self.inner.registration.poll_read_ready().unwrap() {
-            Async::Ready(r) => r,
-            _ => return Async::NotReady,
-        };
+        let ready = try_ready!(self.inner.registration.poll_read_ready());
 
         // Cache the value
         self.inner.read_readiness.store(super::ready2usize(ready), Relaxed);
 
-        ready.into()
-    }
-
-    /// Tests to see if this source is ready to be written to or not.
-    ///
-    /// If this stream is not ready for a write then `NotReady` will be returned
-    /// and the current task will be scheduled to receive a notification when
-    /// the stream is writable again. In other words, this method is only safe
-    /// to call from within the context of a future's task, typically done in a
-    /// `Future::poll` method.
-    ///
-    /// This is mostly equivalent to `self.poll_ready(Ready::writable())`.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn poll_write(&self) -> Async<()> {
-        match self.inner.write_readiness.load(Relaxed) {
-            0 => {}
-            mut n => {
-                // Check what's new with the reactor.
-                if let Some(ready) = self.inner.registration.take_write_ready().unwrap() {
-                    n |= super::ready2usize(ready);
-                    self.inner.write_readiness.store(n, Relaxed);
-                }
-
-                return ().into();
-            }
-        }
-
-        let ready = match self.inner.registration.poll_write_ready().unwrap() {
-            Async::Ready(r) => r,
-            _ => return Async::NotReady,
-        };
-
-        // Cache the value
-        self.inner.write_readiness.store(super::ready2usize(ready), Relaxed);
-
-        ().into()
-    }
-
-    /// Test to see whether this source fulfills any condition listed in `mask`
-    /// provided.
-    ///
-    /// The `mask` given here is a mio `Ready` set of possible events. This can
-    /// contain any events like read/write but also platform-specific events
-    /// such as hup and error. The `mask` indicates events that are interested
-    /// in being ready.
-    ///
-    /// If any event in `mask` is ready then it is returned through
-    /// `Async::Ready`. The `Ready` set returned is guaranteed to not be empty
-    /// and contains all events that are currently ready in the `mask` provided.
-    ///
-    /// If no events are ready in the `mask` provided then the current task is
-    /// scheduled to receive a notification when any of them become ready. If
-    /// the `writable` event is contained within `mask` then this
-    /// `PollEvented`'s `write` task will be blocked and otherwise the `read`
-    /// task will be blocked. This is generally only relevant if you're working
-    /// with this `PollEvented` object on multiple tasks.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn poll_ready(&self, mask: Ready) -> Async<Ready> {
-        let mut ret = Ready::empty();
-
-        if mask.is_empty() {
-            return ret.into();
-        }
-
-        if mask.is_writable() {
-            if self.poll_write().is_ready() {
-                ret = Ready::writable();
-            }
-        }
-
-        let mask = mask - Ready::writable();
-
-        if !mask.is_empty() {
-            if let Async::Ready(v) = self.poll_read2() {
-                ret |= v & mask;
-            }
-        }
-
-        if ret.is_empty() {
-            if mask.is_writable() {
-                self.need_write();
-            }
-
-            if mask.is_readable() {
-                self.need_read();
-            }
-
-            Async::NotReady
-        } else {
-            ret.into()
-        }
+        Ok(ready.into())
     }
 
     /// Indicates to this source of events that the corresponding I/O object is
@@ -290,50 +165,94 @@ impl<E> PollEvented<E> {
     ///
     /// This function will panic if called outside the context of a future's
     /// task.
-    pub fn need_read(&self) {
+    pub fn need_read(&self) -> io::Result<()> {
         self.inner.read_readiness.store(0, Relaxed);
 
-        if self.poll_read().is_ready() {
+        if self.poll_read_ready()?.is_ready() {
             // Notify the current task
             task::current().notify();
         }
+
+        Ok(())
     }
 
-    /// Indicates to this source of events that the corresponding I/O object is
-    /// no longer writable, but it needs to be.
+    /// Tests to see if this source is ready to be written to or not.
     ///
-    /// This function, like `poll_write`, is only safe to call from the context
-    /// of a future's task (typically in a `Future::poll` implementation). It
-    /// informs this readiness stream that the underlying object is no longer
-    /// writable, typically because a "would block" error was seen.
-    ///
-    /// The flag indicating that this stream is writable is unset and the
-    /// current task is scheduled to receive a notification when the stream is
-    /// then again writable.
-    ///
-    /// Note that it is also only valid to call this method if `poll_write`
-    /// previously indicated that the object is writable. That is, this function
-    /// must always be paired with calls to `poll_write` previously.
+    /// If this stream is not ready for a write then `Async::NotReady` will be
+    /// returned and the current task will be scheduled to receive a
+    /// notification when the stream is writable again. In other words, this
+    /// method is only safe to call from within the context of a future's task,
+    /// typically done in a `Future::poll` method.
     ///
     /// # Panics
     ///
     /// This function will panic if called outside the context of a future's
     /// task.
-    pub fn need_write(&self) {
+    pub fn poll_write_ready(&self) -> Poll<mio::Ready, io::Error> {
+        self.register()?;
+
+        match self.inner.write_readiness.load(Relaxed) {
+            0 => {}
+            mut n => {
+                // Check what's new with the reactor.
+                if let Some(ready) = self.inner.registration.take_write_ready()? {
+                    n |= super::ready2usize(ready);
+                    self.inner.write_readiness.store(n, Relaxed);
+                }
+
+                return Ok(super::usize2ready(n).into());
+            }
+        }
+
+        let ready = try_ready!(self.inner.registration.poll_write_ready());
+
+        // Cache the value
+        self.inner.write_readiness.store(super::ready2usize(ready), Relaxed);
+
+        Ok(ready.into())
+    }
+
+    /// Indicates to this source of events that the corresponding I/O object is
+    /// no longer writable, but it needs to be.
+    ///
+    /// This function, like `poll_write_ready`, is only safe to call from the
+    /// context of a future's task (typically in a `Future::poll`
+    /// implementation). It informs this readiness stream that the underlying
+    /// object is no longer writable, typically because a "would block" error
+    /// was seen.
+    ///
+    /// The flag indicating that this stream is writable is unset and the
+    /// current task is scheduled to receive a notification when the stream is
+    /// then again writable.
+    ///
+    /// Note that it is also only valid to call this method if
+    /// `poll_write_ready` previously indicated that the object is writable.
+    /// That is, this function must always be paired with calls to `poll_write`
+    /// previously.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if called outside the context of a future's
+    /// task.
+    pub fn need_write(&self) -> io::Result<()> {
         self.inner.write_readiness.store(0, Relaxed);
 
-        if self.poll_write().is_ready() {
+        if self.poll_write_ready()?.is_ready() {
             // Notify the current task
             task::current().notify();
         }
+
+        Ok(())
     }
 
-    /// Returns a reference to the event loop handle that this readiness stream
-    /// is associated with.
-    pub fn remote(&self) -> &Remote {
-        &self.remote
+    /// Ensure that the I/O resource is registered with the reactor.
+    fn register(&self) -> io::Result<()> {
+        self.inner.registration.register(&self.io)?;
+        Ok(())
     }
+}
 
+impl<E> PollEvented<E> {
     /// Returns a shared reference to the underlying I/O object this readiness
     /// stream is wrapping.
     pub fn get_ref(&self) -> &E {
@@ -345,147 +264,140 @@ impl<E> PollEvented<E> {
     pub fn get_mut(&mut self) -> &mut E {
         &mut self.io
     }
+
+    /// Consumes self, returning the inner I/O object
+    pub fn into_inner(self) -> E {
+        self.io
+    }
 }
 
-impl<E: Read> Read for PollEvented<E> {
+// ===== Read / Write impls =====
+
+impl<E> Read for PollEvented<E>
+where E: Evented + Read,
+{
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_read() {
+        if let Async::NotReady = self.poll_read_ready()? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_mut().read(buf);
 
         if is_wouldblock(&r) {
-            self.need_read();
+            self.need_read()?;
         }
 
-        r
+        return r
     }
 }
 
-impl<E: Write> Write for PollEvented<E> {
+impl<E> Write for PollEvented<E>
+where E: Evented + Write,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = self.poll_write_ready()? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_mut().write(buf);
 
         if is_wouldblock(&r) {
-            self.need_write();
+            self.need_write()?;
         }
 
-        r
+        return r
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = self.poll_write_ready()? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_mut().flush();
 
         if is_wouldblock(&r) {
-            self.need_write();
+            self.need_write()?;
         }
 
-        r
+        return r
     }
 }
 
-impl<E: Read> AsyncRead for PollEvented<E> {
+impl<E> AsyncRead for PollEvented<E>
+where E: Evented + Read,
+{
 }
 
-impl<E: Write> AsyncWrite for PollEvented<E> {
+impl<E> AsyncWrite for PollEvented<E>
+where E: Evented + Write,
+{
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         Ok(().into())
     }
 }
 
-#[allow(deprecated)]
-impl<E: Read + Write> ::io::Io for PollEvented<E> {
-    fn poll_read(&mut self) -> Async<()> {
-        <PollEvented<E>>::poll_read(self)
-    }
-
-    fn poll_write(&mut self) -> Async<()> {
-        <PollEvented<E>>::poll_write(self)
-    }
-}
+// ===== &'a Read / &'a Write impls =====
 
 impl<'a, E> Read for &'a PollEvented<E>
-    where &'a E: Read,
+where E: Evented, &'a E: Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_read() {
+        if let Async::NotReady = self.poll_read_ready()? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_ref().read(buf);
 
         if is_wouldblock(&r) {
-            self.need_read();
+            self.need_read()?;
         }
 
-        r
+        return r
     }
 }
 
 impl<'a, E> Write for &'a PollEvented<E>
-    where &'a E: Write,
+where E: Evented, &'a E: Write,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = self.poll_write_ready()? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_ref().write(buf);
 
         if is_wouldblock(&r) {
-            self.need_write();
+            self.need_write()?;
         }
 
-        r
+        return r
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = self.poll_write_ready()? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_ref().flush();
 
         if is_wouldblock(&r) {
-            self.need_write();
+            self.need_write()?;
         }
 
-        r
+        return r
     }
 }
 
 impl<'a, E> AsyncRead for &'a PollEvented<E>
-    where &'a E: Read,
+where E: Evented, &'a E: Read,
 {
 }
 
 impl<'a, E> AsyncWrite for &'a PollEvented<E>
-    where &'a E: Write,
+where E: Evented, &'a E: Write,
 {
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         Ok(().into())
-    }
-}
-
-#[allow(deprecated)]
-impl<'a, E> ::io::Io for &'a PollEvented<E>
-    where &'a E: Read + Write,
-{
-    fn poll_read(&mut self) -> Async<()> {
-        <PollEvented<E>>::poll_read(self)
-    }
-
-    fn poll_write(&mut self) -> Async<()> {
-        <PollEvented<E>>::poll_write(self)
     }
 }
 
@@ -496,7 +408,8 @@ fn is_wouldblock<T>(r: &io::Result<T>) -> bool {
     }
 }
 
-impl<E: Evented + fmt::Debug> fmt::Debug for PollEvented<E> {
+
+impl<E: fmt::Debug> fmt::Debug for PollEvented<E> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("PollEvented")
          .field("io", &self.io)

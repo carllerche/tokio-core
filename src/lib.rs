@@ -91,7 +91,8 @@
 
 #![doc(html_root_url = "https://docs.rs/tokio-core/0.1")]
 #![deny(missing_docs)]
-#![deny(warnings)]
+// #![deny(warnings)]
+#![allow(warnings)]
 #![cfg_attr(test, allow(deprecated))]
 
 extern crate bytes;
@@ -100,6 +101,8 @@ extern crate futures;
 extern crate iovec;
 extern crate mio;
 extern crate slab;
+extern crate tokio;
+extern crate tokio_executor;
 extern crate tokio_io;
 
 #[macro_use]
