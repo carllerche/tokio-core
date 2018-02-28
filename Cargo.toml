@@ -24,8 +24,8 @@ scoped-tls = "0.1.0"
 slab = "0.4"
 iovec = "0.1"
 tokio-io = "0.1"
-tokio = "0.1.2"
-tokio-executor = "0.1.0"
+tokio = { git = "https://github.com/tokio-rs/tokio" }
+tokio-executor = { git = "https://github.com/tokio-rs/tokio" }
 futures = "0.1.16"
 
 [dev-dependencies]
