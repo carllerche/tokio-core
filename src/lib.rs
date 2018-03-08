@@ -104,6 +104,7 @@ extern crate slab;
 extern crate tokio;
 extern crate tokio_executor;
 extern crate tokio_io;
+extern crate tokio_reactor;
 
 #[macro_use]
 extern crate scoped_tls;

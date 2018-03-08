@@ -118,6 +118,7 @@ pub struct Remote {
 pub struct Handle {
     remote: Remote,
     inner: Weak<RefCell<Inner>>,
+    thread_pool: ::tokio::runtime::TaskExecutor,
 }
 
 enum TimeoutState {
@@ -189,7 +190,15 @@ impl Core {
         Handle {
             remote: self.remote(),
             inner: Rc::downgrade(&self.inner),
+            thread_pool: self.rt.executor().clone(),
         }
+    }
+
+    /// Returns a reference to the runtime backing the instance
+    ///
+    /// This provides access to the newer features of Tokio.
+    pub fn runtime(&self) -> &tokio::runtime::Runtime {
+        &self.rt
     }
 
     /// Generates a remote handle to this event loop which can be used to spawn
@@ -224,6 +233,8 @@ impl Core {
         where F: Future,
     {
         let mut task = executor::spawn(f);
+        let handle = self.rt.handle().clone();
+        let mut executor = self.rt.executor().clone();
 
         // Make sure the future will run at least once on enter
         self.notify_future.notify(0);
@@ -238,7 +249,7 @@ impl Core {
                 }
             }
 
-            self.poll(None);
+            self.poll(None, &handle, &mut executor);
         }
     }
 
@@ -251,64 +262,72 @@ impl Core {
     /// `loop { lp.turn(None) }` is equivalent to calling `run` with an
     /// empty future (one that never finishes).
     pub fn turn(&mut self, max_wait: Option<Duration>) {
-        self.poll(max_wait);
+        let handle = self.rt.handle().clone();
+        let mut executor = self.rt.executor().clone();
+        self.poll(max_wait, &handle, &mut executor);
     }
 
-    fn poll(&mut self, max_wait: Option<Duration>) {
+    fn poll(&mut self, max_wait: Option<Duration>,
+            handle: &tokio::reactor::Handle,
+            sender: &mut tokio::runtime::TaskExecutor) {
         let mut enter = tokio_executor::enter()
             .ok().expect("cannot recursively call into `Core`");
 
-        // Given the `max_wait` variable specified, figure out the actual
-        // timeout that we're going to pass to `poll`. This involves taking a
-        // look at active timers on our heap as well.
-        let start = Instant::now();
-        let timeout = self.inner.borrow_mut().timer_heap.peek().map(|t| {
-            if t.0 < start {
-                Duration::new(0, 0)
-            } else {
-                t.0 - start
-            }
+        ::tokio_reactor::with_default(handle, &mut enter, |enter| {
+            tokio_executor::with_default(sender, enter, |enter| {
+                // Given the `max_wait` variable specified, figure out the actual
+                // timeout that we're going to pass to `poll`. This involves taking a
+                // look at active timers on our heap as well.
+                let start = Instant::now();
+                let timeout = self.inner.borrow_mut().timer_heap.peek().map(|t| {
+                    if t.0 < start {
+                        Duration::new(0, 0)
+                    } else {
+                        t.0 - start
+                    }
+                });
+                let timeout = match (max_wait, timeout) {
+                    (Some(d1), Some(d2)) => Some(cmp::min(d1, d2)),
+                    (max_wait, timeout) => max_wait.or(timeout),
+                };
+
+                // Drain any futures pending spawn
+                {
+                    let mut e = self.executor.borrow_mut();
+                    let mut i = self.inner.borrow_mut();
+
+                    for f in i.pending_spawn.drain(..) {
+                        // Little hack
+                        e.enter(enter).block_on(future::lazy(|| {
+                            TaskExecutor::current().spawn_local(f).unwrap();
+                            Ok::<_, ()>(())
+                        })).unwrap();
+                    }
+                }
+
+                CURRENT_LOOP.set(self, || {
+                    self.executor.borrow_mut()
+                        .enter(enter)
+                        .turn(timeout)
+                        .ok().expect("error in `CurrentThread::turn`");
+                });
+
+                let after_poll = Instant::now();
+                debug!("loop poll - {:?}", after_poll - start);
+                debug!("loop time - {:?}", after_poll);
+
+                // Process all timeouts that may have just occurred, updating the
+                // current time since
+                self.consume_timeouts(after_poll);
+
+                // Process all the events that came in, dispatching appropriately
+                if self.notify_rx.take() {
+                    CURRENT_LOOP.set(self, || self.consume_queue());
+                }
+
+                debug!("loop process, {:?}", after_poll.elapsed());
+            });
         });
-        let timeout = match (max_wait, timeout) {
-            (Some(d1), Some(d2)) => Some(cmp::min(d1, d2)),
-            (max_wait, timeout) => max_wait.or(timeout),
-        };
-
-        // Drain any futures pending spawn
-        {
-            let mut e = self.executor.borrow_mut();
-            let mut i = self.inner.borrow_mut();
-
-            for f in i.pending_spawn.drain(..) {
-                // Little hack
-                e.enter(&mut enter).block_on(future::lazy(|| {
-                    TaskExecutor::current().spawn_local(f).unwrap();
-                    Ok::<_, ()>(())
-                })).unwrap();
-            }
-        }
-
-        CURRENT_LOOP.set(self, || {
-            self.executor.borrow_mut()
-                .enter(&mut enter)
-                .turn(timeout)
-                .ok().expect("error in `CurrentThread::turn`");
-        });
-
-        let after_poll = Instant::now();
-        debug!("loop poll - {:?}", after_poll - start);
-        debug!("loop time - {:?}", after_poll);
-
-        // Process all timeouts that may have just occurred, updating the
-        // current time since
-        self.consume_timeouts(after_poll);
-
-        // Process all the events that came in, dispatching appropriately
-        if self.notify_rx.take() {
-            CURRENT_LOOP.set(self, || self.consume_queue());
-        }
-
-        debug!("loop process, {:?}", after_poll.elapsed());
     }
 
     fn consume_timeouts(&mut self, now: Instant) {
@@ -602,6 +621,18 @@ impl Handle {
         // If that doesn't work, the executor is probably active, so spawn using
         // the global fn.
         TaskExecutor::current().spawn_local(Box::new(f));
+    }
+
+    /// Spawns a new future onto the threadpool
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the spawn fails. Failure occurs if the executor
+    /// is currently at capacity and is unable to spawn a new future.
+    pub fn spawn_send<F>(&self, f: F)
+        where F: Future<Item=(), Error=()> + Send + 'static,
+    {
+        self.thread_pool.spawn(f);
     }
 
     /// Spawns a closure on this event loop.

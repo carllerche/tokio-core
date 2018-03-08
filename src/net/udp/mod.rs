@@ -89,7 +89,7 @@ impl UdpSocket {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.need_write();
+                    self.io.clear_write_ready();
                 }
                 Err(e)
             }
@@ -99,14 +99,14 @@ impl UdpSocket {
     /// Receives data from the socket previously bound with connect().
     /// On success, returns the number of bytes read.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.io.poll_read_ready()? {
+        if let Async::NotReady = self.io.poll_read_ready(mio::Ready::readable())? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
         match self.io.get_ref().recv(buf) {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.need_read();
+                    self.io.clear_read_ready(mio::Ready::readable());
                 }
                 Err(e)
             }
@@ -120,7 +120,7 @@ impl UdpSocket {
     /// is only suitable for calling in a `Future::poll` method and will
     /// automatically handle ensuring a retry once the socket is readable again.
     pub fn poll_read(&self) -> Async<()> {
-        self.io.poll_read_ready()
+        self.io.poll_read_ready(mio::Ready::readable())
             .map(|r| {
                 if r.is_ready() {
                     Async::Ready(())
@@ -162,7 +162,7 @@ impl UdpSocket {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.need_write();
+                    self.io.clear_write_ready();
                 }
                 Err(e)
             }
@@ -193,14 +193,14 @@ impl UdpSocket {
     /// Receives data from the socket. On success, returns the number of bytes
     /// read and the address from whence the data came.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        if let Async::NotReady = self.io.poll_read_ready()? {
+        if let Async::NotReady = self.io.poll_read_ready(mio::Ready::readable())? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
         match self.io.get_ref().recv_from(buf) {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.need_read();
+                    self.io.clear_read_ready(mio::Ready::readable());
                 }
                 Err(e)
             }

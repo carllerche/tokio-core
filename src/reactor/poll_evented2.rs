@@ -1,14 +1,3 @@
-//!
-//! Readiness tracking streams, backing I/O objects.
-//!
-//! This module contains the core type which is used to back all I/O on object
-//! in `tokio-core`. The `PollEvented` type is the implementation detail of
-//! all I/O. Each `PollEvented` manages registration with a reactor,
-//! acquisition of a token, and tracking of the readiness state on the
-//! underlying I/O primitive.
-
-#![allow(warnings)]
-
 use tokio::reactor::{Handle, Registration};
 
 use futures::{task, Async, Poll};
@@ -21,53 +10,79 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 
-/// A concrete implementation of a stream of readiness notifications for I/O
-/// objects that originates from an event loop.
+/// Associates an I/O resource that implements the [`std::Read`] and / or
+/// [`std::Write`] traits with the reactor that drives it.
 ///
-/// Created by the `PollEvented::new` method, each `PollEvented` is
-/// associated with a specific event loop and source of events that will be
-/// registered with an event loop.
+/// `PollEvented` uses [`Registration`] internally to take a type that
+/// implements [`mio::Evented`] as well as [`std::Read`] and or [`std::Write`]
+/// and associate it with a reactor that will drive it.
 ///
-/// An instance of `PollEvented` is essentially the bridge between the `mio`
-/// world and the `tokio-core` world, providing abstractions to receive
-/// notifications about changes to an object's `mio::Ready` state.
+/// Once the [`mio::Evented`] type is wrapped by `PollEvented`, it can be
+/// used from within the future's execution model. As such, the `PollEvented`
+/// type provides [`AsyncRead`] and [`AsyncWrite`] implementations using the
+/// underlying I/O resource as well as readiness events provided by the reactor.
 ///
-/// Each readiness stream has a number of methods to test whether the underlying
-/// object is readable or writable. Once the methods return that an object is
-/// readable/writable, then it will continue to do so until the `need_read` or
-/// `need_write` methods are called.
+/// **Note**: While `PollEvented` is `Sync` (if the underlying I/O type is
+/// `Sync`), the caller must ensure that there are at most two tasks that use a
+/// `PollEvented` instance concurrenty. One for reading and one for writing.
+/// While violating this requirement is "safe" from a Rust memory model point of
+/// view, it will result in unexpected behavior in the form of lost
+/// notifications and tasks hanging.
 ///
-/// That is, this object is typically wrapped in another form of I/O object.
-/// It's the responsibility of the wrapper to inform the readiness stream when a
-/// "would block" I/O event is seen. The readiness stream will then take care of
-/// any scheduling necessary to get notified when the event is ready again.
+/// ## Readiness events
 ///
-/// You can find more information about creating a custom I/O object [online].
+/// Besides just providing [`AsyncRead`] and [`AsyncWrite`] implementations,
+/// this type also supports access to the underlying readiness event stream.
+/// While similar in function to what [`Registration`] provides, the semantics
+/// are a bit different.
 ///
-/// [online]: https://tokio.rs/docs/going-deeper-tokio/core-low-level/#custom-io
+/// Two functions are provided to access the readiness events:
+/// [`poll_read_ready`] and [`poll_write_ready`]. These functions return the
+/// current readiness state of the `PollEvented` instance. If
+/// [`poll_read_ready`] indicates read readiness, immediately calling
+/// [`poll_read_ready`] again will also indicate read readiness.
 ///
-/// ## Readiness to read/write
+/// When the operation is attempted and is unable to succeed due to the I/O
+/// resource not being ready, the caller must call [`clear_read_ready`] or
+/// [`clear_write_ready`]. This clears the readiness state until a new readiness
+/// event is received.
 ///
-/// A `PollEvented` allows listening and waiting for an arbitrary `mio::Ready`
-/// instance, including the platform-specific contents of `mio::Ready`. At most
-/// two future tasks, however, can be waiting on a `PollEvented`. The
-/// `need_read` and `need_write` methods can block two separate tasks, one on
-/// reading and one on writing. Not all I/O events correspond to read/write,
-/// however!
+/// This allows the caller to implement additional funcitons. For example,
+/// [`TcpListener`] implements poll_accept by using [`poll_read_ready`] and
+/// [`clear_write_ready`].
 ///
-/// To account for this a `PollEvented` gets a little interesting when working
-/// with an arbitrary instance of `mio::Ready` that may not map precisely to
-/// "write" and "read" tasks. Currently it is defined that instances of
-/// `mio::Ready` that do *not* return true from `is_writable` are all notified
-/// through `need_read`, or the read task.
+/// ```rust,ignore
+/// pub fn poll_accept(&mut self) -> Poll<(net::TcpStream, SocketAddr), io::Error> {
+///     let ready = Ready::readable();
 ///
-/// In other words, `poll_ready` with the `mio::UnixReady::hup` event will block
-/// the read task of this `PollEvented` if the `hup` event isn't available.
-/// Essentially a good rule of thumb is that if you're using the `poll_ready`
-/// method you want to also use `need_read` to signal blocking and you should
-/// otherwise probably avoid using two tasks on the same `PollEvented`.
-pub struct PollEvented<E> {
-    io: E,
+///     try_ready!(self.poll_evented.poll_read_ready(ready));
+///
+///     match self.poll_evented.get_ref().accept_std() {
+///         Ok(pair) => Ok(Async::Ready(pair)),
+///         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+///             self.poll_evented.clear_read_ready(ready);
+///             Ok(Async::NotReady)
+///         }
+///         Err(e) => Err(e),
+///     }
+/// }
+/// ```
+///
+/// ## Platform-specific events
+///
+/// `PollEvented` also allows receiving platform-specific `mio::Ready` events.
+/// These events are included as part of the read readiness event stream. The
+/// write readiness event stream is only for `Ready::writable()` events.
+///
+/// [`std::Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
+/// [`std::Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
+/// [`AsyncRead`]: ../io/trait.AsyncRead.html
+/// [`AsyncWrite`]: ../io/trait.AsyncWrite.html
+/// [`mio::Evented`]: https://docs.rs/mio/0.6/mio/trait.Evented.html
+/// [`Registration`]: struct.Registration.html
+/// [`TcpListener`]: ../net/struct.TcpListener.html
+pub struct PollEvented<E: Evented> {
+    io: Option<E>,
     inner: Inner,
 }
 
@@ -83,13 +98,54 @@ struct Inner {
 
 // ===== impl PollEvented =====
 
+macro_rules! poll_ready {
+    ($me:expr, $mask:expr, $cache:ident, $poll:ident, $take:ident) => {{
+        $me.register()?;
+
+        // Load cached & encoded readiness.
+        let mut cached = $me.inner.$cache.load(Relaxed);
+        let mask = $mask | platform::hup();
+
+        // See if the current readiness matches any bits.
+        let mut ret = mio::Ready::from_usize(cached) & $mask;
+
+        if ret.is_empty() {
+            // Readiness does not match, consume the registration's readiness
+            // stream. This happens in a loop to ensure that the stream gets
+            // drained.
+            loop {
+                let ready = try_ready!($me.inner.registration.$poll());
+                cached |= ready.as_usize();
+
+                // Update the cache store
+                $me.inner.$cache.store(cached, Relaxed);
+
+                ret |= ready & mask;
+
+                if !ret.is_empty() {
+                    return Ok(ret.into());
+                }
+            }
+        } else {
+            // Check what's new with the registration stream. This will not
+            // request to be notified
+            if let Some(ready) = $me.inner.registration.$take()? {
+                cached |= ready.as_usize();
+                $me.inner.$cache.store(cached, Relaxed);
+            }
+
+            Ok(mio::Ready::from_usize(cached).into())
+        }
+    }}
+}
+
 impl<E> PollEvented<E>
 where E: Evented
 {
     /// Creates a new `PollEvented` associated with the default reactor.
     pub fn new(io: E) -> PollEvented<E> {
         PollEvented {
-            io: io,
+            io: Some(io),
             inner: Inner {
                 registration: Registration::new(),
                 read_readiness: AtomicUsize::new(0),
@@ -101,74 +157,85 @@ where E: Evented
     /// Creates a new `PollEvented` associated with the specified reactor.
     pub fn new_with_handle(io: E, handle: &Handle) -> io::Result<Self> {
         let ret = PollEvented::new(io);
-        ret.inner.registration.register_with(&ret.io, handle)?;
+        ret.inner.registration.register_with(ret.io.as_ref().unwrap(), handle)?;
         Ok(ret)
     }
 
-    /// Tests to see if this source is ready to be read from or not.
-    ///
-    /// If this stream is not ready for a read then `Async::NotReady` will be
-    /// returned and the current task will be scheduled to receive a
-    /// notification when the stream is readable again. In other words, this
-    /// method is only safe to call from within the context of a future's task,
-    /// typically done in a `Future::poll` method.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn poll_read_ready(&self) -> Poll<mio::Ready, io::Error> {
-        self.register()?;
-
-        // Load the cached readiness
-        match self.inner.read_readiness.load(Relaxed) {
-            0 => {}
-            mut n => {
-                // Check what's new with the reactor.
-                if let Some(ready) = self.inner.registration.take_read_ready()? {
-                    n |= super::ready2usize(ready);
-                    self.inner.read_readiness.store(n, Relaxed);
-                }
-
-                return Ok(super::usize2ready(n).into());
-            }
-        }
-
-        let ready = try_ready!(self.inner.registration.poll_read_ready());
-
-        // Cache the value
-        self.inner.read_readiness.store(super::ready2usize(ready), Relaxed);
-
-        Ok(ready.into())
+    /// Returns a shared reference to the underlying I/O object this readiness
+    /// stream is wrapping.
+    pub fn get_ref(&self) -> &E {
+        self.io.as_ref().unwrap()
     }
 
-    /// Indicates to this source of events that the corresponding I/O object is
-    /// no longer readable, but it needs to be.
+    /// Returns a mutable reference to the underlying I/O object this readiness
+    /// stream is wrapping.
+    pub fn get_mut(&mut self) -> &mut E {
+        self.io.as_mut().unwrap()
+    }
+
+    /// Consumes self, returning the inner I/O object
     ///
-    /// This function, like `poll_read`, is only safe to call from the context
-    /// of a future's task (typically in a `Future::poll` implementation). It
-    /// informs this readiness stream that the underlying object is no longer
-    /// readable, typically because a "would block" error was seen.
+    /// This function will deregister the I/O resource from the reactor before
+    /// returning. If the deregistration operation fails, an error is returned.
     ///
-    /// *All* readiness bits associated with this stream except the writable bit
-    /// will be reset when this method is called. The current task is then
-    /// scheduled to receive a notification whenever anything changes other than
-    /// the writable bit. Note that this typically just means the readable bit
-    /// is used here, but if you're using a custom I/O object for events like
-    /// hup/error this may also be relevant.
+    /// Note that deregistering does not guarantee that the I/O resource can be
+    /// registered with a different reactor. Some I/O resource types can only be
+    /// associated with a single reactor instance for their lifetime.
+    pub fn into_inner(mut self) -> io::Result<E> {
+        let io = self.io.take().unwrap();
+        self.inner.registration.deregister(&io)?;
+        Ok(io)
+    }
+
+    /// Check the I/O resource's read readiness state.
     ///
-    /// Note that it is also only valid to call this method if `poll_read`
-    /// previously indicated that the object is readable. That is, this function
-    /// must always be paired with calls to `poll_read` previously.
+    /// The mask argument allows specifying what readiness to notify on. This
+    /// can be any value, including platform specific readiness, **except**
+    /// `writable`. HUP is always implicitly included on platforms that support
+    /// it.
+    ///
+    /// If the resource is not ready for a read then `Async::NotReady` is
+    /// returned and the current task is notified once a new event is received.
+    ///
+    /// The I/O resource will remain in a read-ready state until readiness is
+    /// cleared by calling [`clear_read_ready`].
+    ///
+    /// [`clear_read_ready`]: #method.clear_read_ready
     ///
     /// # Panics
     ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn need_read(&self) -> io::Result<()> {
-        self.inner.read_readiness.store(0, Relaxed);
+    /// This function panics if:
+    ///
+    /// * `ready` includes writable.
+    /// * called from outside of a task context.
+    pub fn poll_read_ready(&self, mask: mio::Ready) -> Poll<mio::Ready, io::Error> {
+        assert!(!mask.is_writable(), "cannot poll for write readiness");
+        poll_ready!(self, mask, read_readiness, poll_read_ready, take_read_ready)
+    }
 
-        if self.poll_read_ready()?.is_ready() {
+    /// Clears the I/O resource's read readiness state and registers the current
+    /// task to be notified once a read readiness event is received.
+    ///
+    /// After calling this function, `poll_read_ready` will return `NotReady`
+    /// until a new read readiness event has been received.
+    ///
+    /// The `mask` argument specifies the readiness bits to clear. This may not
+    /// include `writable` or `hup`.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if:
+    ///
+    /// * `ready` includes writable or HUP
+    /// * called from outside of a task context.
+    pub fn clear_read_ready(&self, ready: mio::Ready) -> io::Result<()> {
+        // Cannot clear write readiness
+        assert!(!ready.is_writable(), "cannot clear write readiness");
+        assert!(!platform::is_hup(&ready), "cannot clear HUP readiness");
+
+        self.inner.read_readiness.fetch_and(!ready.as_usize(), Relaxed);
+
+        if self.poll_read_ready(ready)?.is_ready() {
             // Notify the current task
             task::current().notify();
         }
@@ -176,66 +243,49 @@ where E: Evented
         Ok(())
     }
 
-    /// Tests to see if this source is ready to be written to or not.
+    /// Check the I/O resource's write readiness state.
     ///
-    /// If this stream is not ready for a write then `Async::NotReady` will be
-    /// returned and the current task will be scheduled to receive a
-    /// notification when the stream is writable again. In other words, this
-    /// method is only safe to call from within the context of a future's task,
-    /// typically done in a `Future::poll` method.
+    /// This always checks for writable readiness and also checks for HUP
+    /// readiness on platforms that support it.
+    ///
+    /// If the resource is not ready for a write then `Async::NotReady` is
+    /// returned and the current task is notified once a new event is received.
+    ///
+    /// The I/O resource will remain in a write-ready state until readiness is
+    /// cleared by calling [`clear_write_ready`].
+    ///
+    /// [`clear_write_ready`]: #method.clear_write_ready
     ///
     /// # Panics
     ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
+    /// This function panics if:
+    ///
+    /// * `ready` contains bits besides `writable` and `hup`.
+    /// * called from outside of a task context.
     pub fn poll_write_ready(&self) -> Poll<mio::Ready, io::Error> {
-        self.register()?;
-
-        match self.inner.write_readiness.load(Relaxed) {
-            0 => {}
-            mut n => {
-                // Check what's new with the reactor.
-                if let Some(ready) = self.inner.registration.take_write_ready()? {
-                    n |= super::ready2usize(ready);
-                    self.inner.write_readiness.store(n, Relaxed);
-                }
-
-                return Ok(super::usize2ready(n).into());
-            }
-        }
-
-        let ready = try_ready!(self.inner.registration.poll_write_ready());
-
-        // Cache the value
-        self.inner.write_readiness.store(super::ready2usize(ready), Relaxed);
-
-        Ok(ready.into())
+        poll_ready!(self,
+                    mio::Ready::writable(),
+                    write_readiness,
+                    poll_write_ready,
+                    take_write_ready)
     }
 
-    /// Indicates to this source of events that the corresponding I/O object is
-    /// no longer writable, but it needs to be.
+    /// Resets the I/O resource's write readiness state and registers the current
+    /// task to be notified once a write readiness event is received.
     ///
-    /// This function, like `poll_write_ready`, is only safe to call from the
-    /// context of a future's task (typically in a `Future::poll`
-    /// implementation). It informs this readiness stream that the underlying
-    /// object is no longer writable, typically because a "would block" error
-    /// was seen.
+    /// This only clears writable readiness. HUP (on platforms that support HUP)
+    /// cannot be cleared as it is a final state.
     ///
-    /// The flag indicating that this stream is writable is unset and the
-    /// current task is scheduled to receive a notification when the stream is
-    /// then again writable.
-    ///
-    /// Note that it is also only valid to call this method if
-    /// `poll_write_ready` previously indicated that the object is writable.
-    /// That is, this function must always be paired with calls to `poll_write`
-    /// previously.
+    /// After calling this function, `poll_write_ready(Ready::writable())` will
+    /// return `NotReady` until a new read readiness event has been received.
     ///
     /// # Panics
     ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn need_write(&self) -> io::Result<()> {
-        self.inner.write_readiness.store(0, Relaxed);
+    /// This function will panic if called from outside of a task context.
+    pub fn clear_write_ready(&self) -> io::Result<()> {
+        let ready = mio::Ready::writable();
+
+        self.inner.read_readiness.fetch_and(!ready.as_usize(), Relaxed);
 
         if self.poll_write_ready()?.is_ready() {
             // Notify the current task
@@ -247,27 +297,8 @@ where E: Evented
 
     /// Ensure that the I/O resource is registered with the reactor.
     fn register(&self) -> io::Result<()> {
-        self.inner.registration.register(&self.io)?;
+        self.inner.registration.register(self.io.as_ref().unwrap())?;
         Ok(())
-    }
-}
-
-impl<E> PollEvented<E> {
-    /// Returns a shared reference to the underlying I/O object this readiness
-    /// stream is wrapping.
-    pub fn get_ref(&self) -> &E {
-        &self.io
-    }
-
-    /// Returns a mutable reference to the underlying I/O object this readiness
-    /// stream is wrapping.
-    pub fn get_mut(&mut self) -> &mut E {
-        &mut self.io
-    }
-
-    /// Consumes self, returning the inner I/O object
-    pub fn into_inner(self) -> E {
-        self.io
     }
 }
 
@@ -277,14 +308,14 @@ impl<E> Read for PollEvented<E>
 where E: Evented + Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_read_ready()? {
+        if let Async::NotReady = self.poll_read_ready(mio::Ready::readable())? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_mut().read(buf);
 
         if is_wouldblock(&r) {
-            self.need_read()?;
+            self.clear_read_ready(mio::Ready::readable())?;
         }
 
         return r
@@ -302,7 +333,7 @@ where E: Evented + Write,
         let r = self.get_mut().write(buf);
 
         if is_wouldblock(&r) {
-            self.need_write()?;
+            self.clear_write_ready()?;
         }
 
         return r
@@ -316,7 +347,7 @@ where E: Evented + Write,
         let r = self.get_mut().flush();
 
         if is_wouldblock(&r) {
-            self.need_write()?;
+            self.clear_write_ready()?;
         }
 
         return r
@@ -342,14 +373,14 @@ impl<'a, E> Read for &'a PollEvented<E>
 where E: Evented, &'a E: Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_read_ready()? {
+        if let Async::NotReady = self.poll_read_ready(mio::Ready::readable())? {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
         let r = self.get_ref().read(buf);
 
         if is_wouldblock(&r) {
-            self.need_read()?;
+            self.clear_read_ready(mio::Ready::readable())?;
         }
 
         return r
@@ -367,7 +398,7 @@ where E: Evented, &'a E: Write,
         let r = self.get_ref().write(buf);
 
         if is_wouldblock(&r) {
-            self.need_write()?;
+            self.clear_write_ready()?;
         }
 
         return r
@@ -381,7 +412,7 @@ where E: Evented, &'a E: Write,
         let r = self.get_ref().flush();
 
         if is_wouldblock(&r) {
-            self.need_write()?;
+            self.clear_write_ready()?;
         }
 
         return r
@@ -409,10 +440,46 @@ fn is_wouldblock<T>(r: &io::Result<T>) -> bool {
 }
 
 
-impl<E: fmt::Debug> fmt::Debug for PollEvented<E> {
+impl<E: Evented + fmt::Debug> fmt::Debug for PollEvented<E> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("PollEvented")
          .field("io", &self.io)
          .finish()
+    }
+}
+
+impl<E: Evented> Drop for PollEvented<E> {
+    fn drop(&mut self) {
+        if let Some(io) = self.io.as_ref() {
+            // Ignore errors
+            let _ = self.inner.registration.deregister(io);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+mod platform {
+    use mio::Ready;
+    use mio::unix::UnixReady;
+
+    pub fn hup() -> Ready {
+        UnixReady::hup().into()
+    }
+
+    pub fn is_hup(ready: &Ready) -> bool {
+        UnixReady::from(*ready).is_hup()
+    }
+}
+
+#[cfg(any(windows, target_os = "fuchsia"))]
+mod platform {
+    use mio::Ready;
+
+    pub fn hup() -> Ready {
+        Ready::empty()
+    }
+
+    pub fn is_hup(_: &Ready) -> bool {
+        false
     }
 }
