@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut};
 use futures::stream::Stream;
-use futures::sync::oneshot;
 use futures::{Future, Poll, Async};
 use iovec::IoVec;
 use mio;
@@ -20,7 +19,6 @@ use reactor::{Handle, PollEvented2};
 /// various forms of processing.
 pub struct TcpListener {
     io: PollEvented2<mio::net::TcpListener>,
-    pending_accept: Option<oneshot::Receiver<io::Result<(TcpStream, SocketAddr)>>>,
 }
 
 /// Stream returned by the `TcpListener::incoming` function representing the
@@ -89,7 +87,7 @@ impl TcpListener {
         match self.io.get_ref().accept_std() {
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_read_ready(mio::Ready::readable());
+                    self.io.clear_read_ready(mio::Ready::readable())?;
                 }
                 Err(e)
             },
@@ -125,22 +123,22 @@ impl TcpListener {
     ///   `addr` is an IPv4 address then all sockets accepted will be IPv4 as
     ///   well (same for IPv6).
     pub fn from_listener(listener: net::TcpListener,
-                         addr: &SocketAddr,
+                         _addr: &SocketAddr,
                          handle: &Handle) -> io::Result<TcpListener> {
-        let l = try!(mio::net::TcpListener::from_listener(listener, addr));
+        let l = try!(mio::net::TcpListener::from_std(listener));
         TcpListener::new(l, handle)
     }
 
     fn new(listener: mio::net::TcpListener, handle: &Handle)
            -> io::Result<TcpListener> {
         let io = try!(PollEvented2::new_with_handle(listener, handle.new_tokio_handle()));
-        Ok(TcpListener { io: io, pending_accept: None })
+        Ok(TcpListener { io: io })
     }
 
     fn new2(listener: mio::net::TcpListener)
            -> io::Result<TcpListener> {
         let io = PollEvented2::new(listener);
-        Ok(TcpListener { io: io, pending_accept: None })
+        Ok(TcpListener { io: io })
     }
 
     /// Test whether this socket is ready to be read or not.
@@ -393,7 +391,7 @@ impl TcpStream {
         }
         let r = self.io.get_ref().peek(buf);
         if is_wouldblock(&r) {
-            self.io.clear_read_ready(mio::Ready::readable());
+            self.io.clear_read_ready(mio::Ready::readable())?;
         }
         return r
 
@@ -603,7 +601,7 @@ impl ::io::Io for TcpStream {
         }
         let r = self.io.get_ref().read_bufs(bufs);
         if is_wouldblock(&r) {
-            self.io.clear_read_ready(mio::Ready::readable());
+            self.io.clear_read_ready(mio::Ready::readable())?;
         }
         return r
     }
@@ -614,7 +612,7 @@ impl ::io::Io for TcpStream {
         }
         let r = self.io.get_ref().write_bufs(bufs);
         if is_wouldblock(&r) {
-            self.io.clear_write_ready();
+            self.io.clear_write_ready()?;
         }
         return r
     }
@@ -688,7 +686,7 @@ impl<'a> AsyncRead for &'a TcpStream {
                 Ok(Async::Ready(n))
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.clear_read_ready(mio::Ready::readable());
+                self.io.clear_read_ready(mio::Ready::readable())?;
                 Ok(Async::NotReady)
             }
             Err(e) => Err(e),
@@ -721,7 +719,7 @@ impl<'a> AsyncWrite for &'a TcpStream {
                 Ok(Async::Ready(n))
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.clear_write_ready();
+                self.io.clear_write_ready()?;
                 Ok(Async::NotReady)
             }
             Err(e) => Err(e),

@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::cmp;
 use std::fmt;
-use std::io::{self, ErrorKind};
+use std::io;
 use std::mem;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -25,7 +25,6 @@ use futures::executor::{self, Spawn, Notify};
 use futures::sync::mpsc;
 use futures::task::Task;
 use mio;
-use mio::event::Evented;
 use slab::Slab;
 
 use heap::{Heap, Slot};
@@ -133,9 +132,6 @@ enum Message {
     CancelTimeout(usize),
     Run(Box<FnBox>),
 }
-
-const TOKEN_MESSAGES: usize = 0;
-const TOKEN_FUTURE: usize = 1;
 
 // ===== impl Core =====
 
@@ -603,8 +599,6 @@ impl Handle {
     pub fn spawn<F>(&self, f: F)
         where F: Future<Item=(), Error=()> + 'static,
     {
-        use tokio_executor::Executor;
-
         let inner = match self.inner.upgrade() {
             Some(inner) => inner,
             None => {
@@ -620,7 +614,7 @@ impl Handle {
 
         // If that doesn't work, the executor is probably active, so spawn using
         // the global fn.
-        TaskExecutor::current().spawn_local(Box::new(f));
+        let _ = TaskExecutor::current().spawn_local(Box::new(f));
     }
 
     /// Spawns a new future onto the threadpool
@@ -731,10 +725,6 @@ impl<F: FnOnce(&Core) + Send + 'static> FnBox for F {
     }
 }
 
-fn read_ready() -> mio::Ready {
-    mio::Ready::readable() | platform::hup()
-}
-
 const READ: usize = 1 << 0;
 const WRITE: usize = 1 << 1;
 
@@ -764,20 +754,6 @@ fn usize2ready(bits: usize) -> mio::Ready {
 mod platform {
     use mio::Ready;
     use mio::unix::UnixReady;
-
-    #[cfg(any(target_os = "dragonfly", target_os = "freebsd"))]
-    pub fn all() -> Ready {
-        hup() | UnixReady::aio()
-    }
-
-    #[cfg(not(any(target_os = "dragonfly", target_os = "freebsd")))]
-    pub fn all() -> Ready {
-        hup()
-    }
-
-    pub fn hup() -> Ready {
-        UnixReady::hup().into()
-    }
 
     const HUP: usize = 1 << 2;
     const ERROR: usize = 1 << 3;

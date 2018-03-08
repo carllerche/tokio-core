@@ -89,7 +89,7 @@ impl UdpSocket {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_write_ready();
+                    self.io.clear_write_ready()?;
                 }
                 Err(e)
             }
@@ -106,7 +106,7 @@ impl UdpSocket {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_read_ready(mio::Ready::readable());
+                    self.io.clear_read_ready(mio::Ready::readable())?;
                 }
                 Err(e)
             }
@@ -162,7 +162,7 @@ impl UdpSocket {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_write_ready();
+                    self.io.clear_write_ready()?;
                 }
                 Err(e)
             }
@@ -200,7 +200,7 @@ impl UdpSocket {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.clear_read_ready(mio::Ready::readable());
+                    self.io.clear_read_ready(mio::Ready::readable())?;
                 }
                 Err(e)
             }
