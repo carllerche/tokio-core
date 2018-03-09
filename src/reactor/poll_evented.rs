@@ -349,7 +349,7 @@ impl<E> PollEvented<E> {
 
 impl<E: Read> Read for PollEvented<E> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_read() {
+        if let Async::NotReady = PollEvented::poll_read(self) {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
@@ -365,7 +365,7 @@ impl<E: Read> Read for PollEvented<E> {
 
 impl<E: Write> Write for PollEvented<E> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = PollEvented::poll_write(self) {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
@@ -379,7 +379,7 @@ impl<E: Write> Write for PollEvented<E> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = PollEvented::poll_write(self) {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
@@ -417,7 +417,7 @@ impl<'a, E> Read for &'a PollEvented<E>
     where &'a E: Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_read() {
+        if let Async::NotReady = PollEvented::poll_read(self) {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
@@ -435,7 +435,7 @@ impl<'a, E> Write for &'a PollEvented<E>
     where &'a E: Write,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = PollEvented::poll_write(self) {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
@@ -449,7 +449,7 @@ impl<'a, E> Write for &'a PollEvented<E>
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Async::NotReady = self.poll_write() {
+        if let Async::NotReady = PollEvented::poll_write(self) {
             return Err(io::ErrorKind::WouldBlock.into())
         }
 
