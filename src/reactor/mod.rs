@@ -815,15 +815,6 @@ mod platform {
 mod platform {
     use mio::Ready;
 
-    pub fn all() -> Ready {
-        // No platform-specific Readinesses for Windows
-        Ready::empty()
-    }
-
-    pub fn hup() -> Ready {
-        Ready::empty()
-    }
-
     pub fn ready2usize(_r: Ready) -> usize {
         0
     }
